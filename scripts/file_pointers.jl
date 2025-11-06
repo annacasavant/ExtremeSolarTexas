@@ -1,4 +1,4 @@
-SOURCE_DATA_DIR = "./input_data"
+SOURCE_DATA_DIR = "scripts/input_data"
 COST_FUNCTION_PATHS = joinpath(SOURCE_DATA_DIR, "Thermal", "cost_function_plots")
 cost_function_file = joinpath(SOURCE_DATA_DIR, "Thermal", "cost_function_params.json")
 
@@ -26,7 +26,9 @@ perfect_load_time_series_da =
 perfect_load_time_series_realtime =
     joinpath(SOURCE_DATA_DIR, "Load", "intra-hourly_perfect_load_forecast.h5")
 
-solar_time_series = joinpath(SOURCE_DATA_DIR, "Solar", "DA_time_series_files")
+solar_time_series_da = joinpath(SOURCE_DATA_DIR, "Solar", "DA_time_series_files")
+solar_time_series_ha = joinpath(SOURCE_DATA_DIR, "Solar", "HA_time_series_files")
+solar_time_series_rt = joinpath(SOURCE_DATA_DIR, "Solar", "RT_time_series_files")
 
 hydro_time_series = joinpath(SOURCE_DATA_DIR, "Hydropower","HYDRO")
 

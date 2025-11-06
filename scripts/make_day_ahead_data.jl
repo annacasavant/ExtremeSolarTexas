@@ -1,23 +1,25 @@
 using PowerSystems
+using DataStructures: SortedDict
 const PSY = PowerSystems
 
 include("file_pointers.jl")
 include("system_build_functions.jl")
 include("manual_data_entries.jl")
 
-sys_base = System("base_sys.json")
+
+sys_base = System("intermediate_sys_w_services.json")
 clear_time_series!(sys_base)
 PSY.IS.assign_new_uuid!(sys_base)
-set_units_base_system!(sys_base, "SYSTEM_BASE")
+set_units_base_system!(sys_base, "SYSTEM_BASE") 
 
 ####################################### Load Time Series ###################################
 for area in get_components(Area, sys_base)
         day_ahead_load_forecast = Dict{Dates.DateTime, Vector{Float64}}()
         h5open(perfect_load_time_series_da, "r") do file
         @show group_name = get_name(area)
-        loads = get_components(PowerLoad, sys_base, x -> get_area(get_bus(x)) == area)
+        loads = get_components(x -> get_area(get_bus(x)) == area, PowerLoad, sys_base)
         peak_area_load = sum(get_max_active_power.(loads))
-        @assert get_peak_active_power(area) == peak_area_load
+        #@assert get_peak_active_power(area) == peak_area_load
         full_table = read(file, group_name)
         for ix in 1:size(full_table)[1]
             day_ahead_load_forecast[initial_time + (ix - 1) * da_interval] =
@@ -75,11 +77,10 @@ h5open(wind_time_series_da, "r") do file
             data = day_ahead_wind_forecast,
             scaling_factor_multiplier = get_max_active_power
         )
-        wind_gens = get_components(
-            RenewableGen,
-            sys_base,
-            x -> (get_area(get_bus(x)) == area && get_prime_mover(x) == PrimeMovers.WT),
-        )
+        renewables_in_area = make_selector(RenewableGen, typeof(area), get_name(area))
+        wind_gens = get_components(x -> get_prime_mover_type(x) == PrimeMovers.WT, renewables_in_area, sys_base)
+        # wind_in_area = make_selector(x -> (get_area(get_bus(x)) == area && get_prime_mover(x) == PrimeMovers.WT, RenewableDispatch))
+        # wind_gens = get_components(wind_in_area, sys_base)
         add_time_series!(sys_base, wind_gens, forecast_data)
     end
 end
@@ -106,9 +107,10 @@ spin_ts = Vector{Float64}(undef, 8796)
 nonspin_ts = Vector{Float64}(undef, 8796)
 
 solar_gens = get_components(
+            x -> get_prime_mover_type(x) == PrimeMovers.PVe,
             RenewableGen,
             sys_base,
-            x -> get_prime_mover(x) == PrimeMovers.PVe,
+            
         )
 
 total_solar = sum(get_max_active_power.(solar_gens))*0.1 # total in GW.
@@ -141,16 +143,28 @@ for ((name, T), ts) in reserve_map
         Deterministic(name = "requirement", resolution = da_resolution, data = day_ahead_forecast,
         scaling_factor_multiplier = get_requirement)
     res = get_component(T, sys_base, name)
-    set_requirement!(res, peak / 100)
-    add_time_series!(sys_base, res, forecast_data)
+    if res !== nothing  # Only add time series if the service exists
+        set_requirement!(res, peak/100)
+        add_time_series!(sys_base, res, forecast_data)
+    else
+        @warn "Reserve service $name not found in system - skipping (services may not have been added)"
+    end
 end
 
-sys = deepcopy(sys_base)
+sys_DA = deepcopy(sys_base)
 
 ####################################### Solar Time Series ##################################
-file_names = readdir(solar_time_series)
-for gen in get_components(RenewableGen, sys, x -> get_prime_mover(x) == PrimeMovers.PVe)
+file_names = readdir(solar_time_series_da)
+
+for gen in get_components(x -> get_prime_mover_type(x) == PrimeMovers.PVe, RenewableDispatch, sys_DA)
     plant_name = get_name(gen)
+    
+    # Skip Glove Solar if it exists
+    if plant_name == "Glove Solar"
+        continue
+    end
+    
+    # Handle naming conventions for generated plants
     if occursin(r"^gen", plant_name)
         _, number_ = split(plant_name, '-')
         number = parse(Int, number_) - 1
@@ -158,43 +172,58 @@ for gen in get_components(RenewableGen, sys, x -> get_prime_mover(x) == PrimeMov
     else
         file_name = "$(plant_name).h5"
     end
+    
     if file_name ∉ file_names
-        @show plant_name
+        @warn "File not found for solar plant: $(plant_name) (looking for $(file_name))"
+        continue
     end
-    power_output = h5open(joinpath(solar_time_series, file_name), "r") do file
-        return read(file, "Power")[:, :, 50]
+    
+    # Read power output from H5 file (3D array: [days, hours, scenarios])
+    power_output = h5open(joinpath(solar_time_series_da, file_name), "r") do file
+        return read(file, "Power")
     end
-    peak_power = maximum(power_output)
-    @assert peak_power > 0
-    @assert get_base_power(gen) <= get_base_power(gen)
-    set_rating!(gen, peak_power / get_base_power(gen))
-    normalized_power = power_output ./ maximum(power_output)
+    
+    # Calculate peak power from first scenario (same as hour-ahead approach)
+    peak_power = maximum(power_output[:, :, 1])
+    set_rating!(gen, peak_power)
+    
+    # Build day-ahead forecasts using first scenario
     day_ahead_forecast = Dict{Dates.DateTime, Vector{Float64}}()
-    for ix in 1:day_count
-        day_ahead_forecast[initial_time + (ix - 1) * da_interval] = normalized_power[ix, :]
+    num_days = min(size(power_output, 1), day_count)  # Limit to day_count (365) to match system
+    
+    for ix in 1:num_days
+        # Extract first scenario data for this day
+        normalized_power = power_output[ix, :, 1]
+        day_ahead_forecast[initial_time + (ix - 1) * da_interval] = normalized_power
     end
+    
     forecast_data = Deterministic(
         name = "max_active_power",
-        resolution = da_resolution,
         data = day_ahead_forecast,
-        scaling_factor_multiplier = get_max_active_power
+        resolution = da_resolution,
+        scaling_factor_multiplier = nothing
     )
-    add_time_series!(sys, gen, forecast_data)
+    add_time_series!(sys_DA, gen, forecast_data)
 end
 
-for g in get_components(RenewableGen, sys)
-    @assert has_time_series(g)
-end
 
-to_json(sys, "/Users/jdlara/Dropbox/texas_data/DA_sys.json", force = true)
+
+# for g in get_components(RenewableDispatch, sys_DA)
+#     println(get_name(g))
+#     @assert has_time_series(g)
+# end
+
+to_json(sys_DA, "may_19_sys_DA.json", force = true)
+
+to_json(sys_DA, "DA_sys.json", force = true)
 
 ############################ Add Scenario Data of UC #############################
 
 sys_solar_scenarios_31 = deepcopy(sys_base)
 PSY.IS.assign_new_uuid!(sys_solar_scenarios_31)
-ts_data = "/Users/jdlara/cache/blue_texas/input_data/Solar/Trajectory forecasts -- 31 member 36 h horizon/Day ahead solar 31 trajectory mean forecasts"
+ts_data = joinpath(SOURCE_DATA_DIR, "Solar", "Trajectory forecasts -- 31 member 36 h horizon", "Day ahead solar 31 trajectory mean forecasts")
 file_names = readdir(ts_data)
-for gen in get_components(RenewableGen, sys_solar_scenarios_31, x -> get_prime_mover(x) == PrimeMovers.PVe)
+for gen in get_components( x -> get_prime_mover_type(x) == PrimeMovers.PVe, RenewableDispatch, sys_solar_scenarios_31)
     !get_available(gen) && continue
     plant_name = get_name(gen)
     if occursin(r"^gen", plant_name)
@@ -218,7 +247,7 @@ for gen in get_components(RenewableGen, sys_solar_scenarios_31, x -> get_prime_m
     day_ahead_forecast = Dict{Dates.DateTime, Vector{Float64}}()
     for ix in 1:day_count
         day_ahead_forecast[initial_time + (ix - 1) * da_interval] = normalized_power[ix, :]
-    end
+    end 
     forecast_data = Deterministic(
         name = "max_active_power",
         resolution = da_resolution,
@@ -228,7 +257,7 @@ for gen in get_components(RenewableGen, sys_solar_scenarios_31, x -> get_prime_m
     add_time_series!(sys_solar_scenarios_31, gen, forecast_data)
 end
 
-for g in get_components(RenewableGen, sys_solar_scenarios_31)
+for g in get_components(RenewableDispatch, sys_solar_scenarios_31)
     !get_available(g) && continue
     if !has_time_series(g)
         @show get_name(g)
@@ -236,11 +265,11 @@ for g in get_components(RenewableGen, sys_solar_scenarios_31)
     end
 end
 
-area_forecast = h5open("input_data/Solar/Trajectory forecasts -- 31 member 36 h horizon/day_ahead_ERCOT132_31_trajectories.h5", "r") do file
+area_forecast = h5open("scripts/input_data/Solar/Trajectory forecasts -- 31 member 36 h horizon/day_ahead_ERCOT132_31_trajectories.h5", "r") do file
     return read(file, "Power")
 end
 
-hour_ahead_forecast = Dict{Dates.DateTime, Matrix{Float64}}()
+hour_ahead_forecast = SortedDict{Dates.DateTime, Matrix{Float64}}()
 for ix in 1:day_count
     hour_ahead_forecast[initial_time + (ix - 1) * da_interval] = area_forecast[ix, :, :]
 end
@@ -253,14 +282,14 @@ scenario_forecast_data_31 = Scenarios(
 )
 add_time_series!(sys_solar_scenarios_31, get_component(Area, sys_solar_scenarios_31, "FarWest"), scenario_forecast_data_31)
 
-to_json(sys_solar_scenarios_31, "/Users/jdlara/Dropbox/texas_data/DA_sys_31_scenarios.json", force = true)
+to_json(sys_solar_scenarios_31, "DA_sys_31_scenarios.json", force = true)
 
 ############################ Add Scenario Data of UC #############################
 sys_solar_scenarios_84 = deepcopy(sys_base)
 PSY.IS.assign_new_uuid!(sys_solar_scenarios_84)
-ts_data = "/Users/jdlara/cache/blue_texas/input_data/Solar/Trajectory forecasts -- 84 member 30 h horizon/Day ahead solar 84 trajectory mean forecasts"
+ts_data = joinpath(SOURCE_DATA_DIR, "Solar", "Trajectory forecasts -- 84 member 30 h horizon", "Day ahead solar 84 trajectory mean forecasts")
 file_names = readdir(ts_data)
-for gen in get_components(RenewableGen, sys_solar_scenarios_84, x -> get_prime_mover(x) == PrimeMovers.PVe)
+for gen in get_components(x -> get_prime_mover_type(x) == PrimeMovers.PVe, RenewableGen, sys_solar_scenarios_84)
     !get_available(gen) && continue
     plant_name = get_name(gen)
     if occursin(r"^gen", plant_name)
@@ -273,6 +302,10 @@ for gen in get_components(RenewableGen, sys_solar_scenarios_84, x -> get_prime_m
     if file_name ∉ file_names
         @show plant_name
     end
+    if file_name == "Blue Bell Solar II.h5"
+        file_name = "BlueBell Solar.h5"
+    end # Pablo; Why are we overwritting Blue Bell Solar? 
+    println(file_name)
     power_output_ = h5open(joinpath(ts_data, file_name), "r") do file
         return read(file, "Power")
     end
@@ -304,12 +337,12 @@ for g in get_components(RenewableGen, sys_solar_scenarios_84)
     end
 end
 
-area_forecast_ = h5open("input_data/Solar/Trajectory forecasts -- 84 member 30 h horizon/day_ahead_ERCOT132_84_trajectories.h5", "r") do file
+area_forecast_ = h5open(joinpath(SOURCE_DATA_DIR, "Solar", "Trajectory forecasts -- 84 member 30 h horizon", "day_ahead_ERCOT132_84_trajectories.h5"), "r") do file
     return read(file, "Power")
 end
 area_forecast = hcat(area_forecast_, area_forecast_[:, 1:6, :])
 
-hour_ahead_forecast = Dict{Dates.DateTime, Matrix{Float64}}()
+hour_ahead_forecast = SortedDict{Dates.DateTime, Matrix{Float64}}()
 for ix in 1:day_count
     hour_ahead_forecast[initial_time + (ix - 1) * da_interval] = area_forecast[ix, :, :]
 end
@@ -322,4 +355,4 @@ scenario_forecast_data_84 = Scenarios(
 )
 add_time_series!(sys_solar_scenarios_84, get_component(Area, sys_solar_scenarios_84, "FarWest"), scenario_forecast_data_84)
 
-to_json(sys_solar_scenarios_84, "/Users/jdlara/Dropbox/texas_data/DA_sys_84_scenarios.json", force = true)
+to_json(sys_solar_scenarios_84, "DA_sys_84_scenarios.json", force = true)

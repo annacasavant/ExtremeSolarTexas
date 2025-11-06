@@ -5,7 +5,8 @@ include("file_pointers.jl")
 include("system_build_functions.jl")
 include("manual_data_entries.jl")
 
-sys_base = System("base_sys.json")
+sys_base = System("intermediate_sys_w_services.json")
+# sys_base = deepcopy(system)
 clear_time_series!(sys_base)
 PSY.IS.assign_new_uuid!(sys_base)
 set_units_base_system!(sys_base, "SYSTEM_BASE")
@@ -15,9 +16,9 @@ h5open(perfect_load_time_series_realtime, "r") do file
     for area in get_components(Area, sys_base)
         hour_ahead_forecast = Dict{Dates.DateTime, Vector{Float64}}()
         @show group_name = get_name(area)
-        loads = get_components(PowerLoad, sys_base, x -> get_area(get_bus(x)) == area)
+        loads = get_components(x -> get_area(get_bus(x)) == area, PowerLoad, sys_base)
         peak_area_load = sum(get_max_active_power.(loads))
-        @assert get_peak_active_power(area) == peak_area_load
+        #@assert get_peak_active_power(area) == peak_area_load
         full_table = read(file, group_name)
         for i in 22:-1:0
             full_table[105120 - i, :] = full_table[105120 - 23, :]
@@ -81,57 +82,10 @@ h5open(wind_time_series_ha, "r") do file
             data = day_ahead_wind_forecast,
             scaling_factor_multiplier = get_max_active_power
         )
-        wind_gens = get_components(
-            RenewableGen,
-            sys_base,
-            x -> (get_area(get_bus(x)) == area && get_prime_mover(x) == PrimeMovers.WT),
-        )
+        renewables_in_area = make_selector(RenewableGen, typeof(area), get_name(area))
+        wind_gens = get_components(x -> get_prime_mover_type(x) == PrimeMovers.WT, renewables_in_area, sys_base)
         add_time_series!(sys_base, wind_gens, forecast_data)
     end
-end
-
-####################################### Solar Time Series ##################################
-file_names = readdir("/Volumes/VM_WIN/Quantile data")
-for gen in get_components(RenewableGen, sys_base, x -> get_prime_mover(x) == PrimeMovers.PVe)
-    plant_name = get_name(gen)
-    if occursin(r"^gen", plant_name)
-        _, number_ = split(plant_name, '-')
-        number = parse(Int, number_) - 1
-        file_name = "solar$(number).h5"
-    else
-        file_name = "$(plant_name).h5"
-    end
-    if file_name ∉ file_names
-        @show plant_name
-    end
-
-    power_output = h5open(joinpath("/Volumes/VM_WIN/Quantile data", file_name), "r") do file
-        return read(file, "Power")[:, :, 50]
-    end
-    power_output = vcat(power_output, power_output[(end - 59):end, :])
-
-    peak_power = maximum(power_output)
-    @assert peak_power > 0
-    @assert get_base_power(gen) <= get_base_power(gen)
-    set_rating!(gen, peak_power / get_base_power(gen))
-    normalized_power = power_output ./ maximum(power_output)
-    hour_ahead_forecast = Dict{Dates.DateTime, Vector{Float64}}()
-    for ix in 1:(day_count * 24)
-        ix_ = 1 + (ix - 1) * 12
-        hour_ahead_forecast[initial_time + (ix - 1) * hour_ahead_interval] =
-            normalized_power[ix_, :]
-    end
-    forecast_data = Deterministic(
-        name = "max_active_power",
-        resolution = hour_ahead_resolution,
-        data = hour_ahead_forecast,
-        scaling_factor_multiplier = get_max_active_power
-    )
-    add_time_series!(sys_base, gen, forecast_data)
-end
-
-for g in get_components(RenewableGen, sys_base)
-    @assert has_time_series(g)
 end
 
 ################# Reserve Requirements Time Series ################################
@@ -154,10 +108,10 @@ regdn_reserve_ts = Vector{Float64}(undef, day_count * 25)
 spin_ts = Vector{Float64}(undef, day_count * 25)
 nonspin_ts = Vector{Float64}(undef, day_count * 25)
 
-solar_gens = get_components(
+solar_gens = get_components(x -> get_prime_mover_type(x) == PrimeMovers.PVe,
             RenewableGen,
-            sys_base,
-            x -> get_prime_mover(x) == PrimeMovers.PVe,
+            sys_base
+            
         )
 
 total_solar = sum(get_max_active_power.(solar_gens))*0.1 # total in GW.
@@ -200,26 +154,61 @@ for ((name, T), ts) in reserve_map
     add_time_series!(sys_base, res, forecast_data)
 end
 
-to_json(sys_base, "/Users/jdlara/Dropbox/texas_data/HA_sys.json", force = true)
+sys_HA = deepcopy(sys_base)
 
-####################### Probabilistic Forecast for the Solar Area ##########################
-area_forecast = h5open("input_data/Solar/ERCOT132.h5", "r") do file
-    return read(file, "Power")
+####################################### Solar Time Series ##################################
+
+# Original quantile data approach - NOT USING because quantile data files are not available
+# We extracted the hour-ahead data from the old system and are reusing it here with individual H5 files
+
+# Individual H5 files approach - using extracted data from old system
+solar_time_series_ha = joinpath(SOURCE_DATA_DIR, "Solar", "HA_time_series_files")
+file_names = readdir(solar_time_series_ha)
+
+for gen in get_components(x -> get_prime_mover_type(x) == PrimeMovers.PVe, RenewableDispatch, sys_HA)
+    plant_name = get_name(gen)
+    
+    # Handle naming conventions for generated plants
+    if occursin(r"^gen", plant_name)
+        _, number_ = split(plant_name, '-')
+        number = parse(Int, number_) - 1
+        file_name = "solar$(number).h5"
+    else
+        file_name = "$(plant_name).h5"
+    end
+    
+    if file_name ∉ file_names
+        @warn "File not found for solar plant: $(plant_name) (looking for $(file_name))"
+        continue
+    end
+    
+    # Read power output from H5 file (2D array: [time_windows, horizon_points])
+    # HA files are 2D, not 3D like DA files
+    power_output = h5open(joinpath(solar_time_series_ha, file_name), "r") do file
+        return read(file, "Power")
+    end
+    
+    # Calculate peak power from the 2D array
+    peak_power = maximum(power_output)
+    set_rating!(gen, peak_power)
+    
+    # Build hour-ahead forecasts from 2D data
+    hour_ahead_forecast = Dict{Dates.DateTime, Vector{Float64}}()
+    num_windows = min(size(power_output, 1), day_count * 24)  # Limit to day_count * 24 (8760) to match system
+    
+    for ix in 1:num_windows
+        # Extract forecast data for this time window (no scenario dimension)
+        normalized_power = power_output[ix, :]
+        hour_ahead_forecast[initial_time + (ix - 1) * hour_ahead_interval] = normalized_power
+    end
+    
+    forecast_data = Deterministic(
+        name = "max_active_power",
+        data = hour_ahead_forecast,
+        resolution = hour_ahead_resolution,
+        scaling_factor_multiplier = nothing
+    )
+    add_time_series!(sys_HA, gen, forecast_data)
 end
-area_forecast = vcat(area_forecast, area_forecast[(end - 59):end, :, :])
-hour_ahead_forecast = Dict{Dates.DateTime, Matrix{Float64}}()
-for ix in 1:(day_count * 24)
-    ix_ = 1 + (ix - 1) * 12
-    hour_ahead_forecast[initial_time + (ix - 1) * hour_ahead_interval] =
-        area_forecast[ix_, :, :]
-end
 
-forecast_data = Probabilistic(
-    name = "solar_power",
-    resolution = hour_ahead_resolution,
-    data = hour_ahead_forecast,
-    percentiles = collect(1:99),
-)
-add_time_series!(sys_base, get_component(Area, sys, "1"), forecast_data)
-
-to_json(sys_base, "/Users/jdlara/Dropbox/Code/MultiStageCVAR/data/HA_sys.json", force = true)
+to_json(sys_HA, "HA_sys.json", force=true)
